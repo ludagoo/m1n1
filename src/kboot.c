@@ -2629,9 +2629,11 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
  * 0xd0000 and DATA 0x128000. TEXT's DART address is the encoder DART's
  * vm-base (its low 32 bits are 0) and DATA follows it; that is the T8112
  * handoff, not the M4 remap addresses. /chosen aurora,ave-text-crc32 and
- * aurora,ave-data-crc32 are the raw segment CRC32s. A node iBoot did not
- * preload is left as the DT has it, so the driver reports "no preloaded
- * firmware" instead of being pointed at some other coprocessor's image.
+ * aurora,ave-data-crc32 are the raw segment CRC32s. The same lines are
+ * appended to /chosen aurora,ave-handoff, since Linux does not keep this
+ * console. A node iBoot did not preload is left as the DT has it, so the
+ * driver reports "no preloaded firmware" instead of being pointed at some
+ * other coprocessor's image.
  */
 #define AVE_6070_TEXT_SIZE 0xd0000u
 #define AVE_6070_DATA_SIZE 0x128000u
@@ -2739,6 +2741,23 @@ static int ave_attach_region(const char *dev_path, u32 dev_phandle, u64 phys, u6
     return dt_device_add_mem_region(dev_path, mem_phandle, NULL);
 }
 
+/* Linux does not keep m1n1's console, so the boot reason is also a DT string. */
+static void ave_record(const char *msg)
+{
+    int chosen = fdt_path_offset(dt, "/chosen");
+
+    printf("%s\n", msg);
+    if (chosen < 0 || fdt_appendprop_string(dt, chosen, "aurora,ave-handoff", msg))
+        printf("FDT: AVE: could not record handoff note\n");
+}
+
+#define ave_soft(...)                                                                              \
+    do {                                                                                           \
+        char _ave_msg[320];                                                                        \
+        snprintf(_ave_msg, sizeof(_ave_msg), __VA_ARGS__);                                         \
+        ave_record(_ave_msg);                                                                      \
+    } while (0)
+
 static int ave_export_crc(const char *prop, u32 crc)
 {
     char value[9];
@@ -2751,7 +2770,7 @@ static int ave_export_crc(const char *prop, u32 crc)
     have = fdt_getprop(dt, chosen, prop, NULL);
     if (have) {
         if (strcmp(have, value))
-            printf("FDT: AVE: %s is %s, this segment is %s\n", prop, have, value);
+            ave_soft("FDT: AVE: %s is %s, this segment is %s", prop, have, value);
         return 0;
     }
     return fdt_setprop_string(dt, chosen, prop, value);
@@ -2803,7 +2822,7 @@ static int ave_dart_vm_base(int node, const char *paired, u64 *vm_base)
         if (ave_read_u64_prop(dnode, "vm-base", &vm) || (vm & (SZ_16K - 1)))
             continue;
         *vm_base = vm;
-        printf("FDT: AVE DART %s vm-base %#lx\n", paths[i], vm);
+        ave_soft("FDT: AVE DART %s vm-base %#lx", paths[i], vm);
         return 0;
     }
     /*
@@ -2816,7 +2835,7 @@ static int ave_dart_vm_base(int node, const char *paired, u64 *vm_base)
 
         if (dnode >= 0 && !ave_read_u64_prop(dnode, "vm-base", &vm) && !(vm & (SZ_16K - 1))) {
             *vm_base = vm;
-            printf("FDT: AVE DART %s vm-base %#lx\n", paired, vm);
+            ave_soft("FDT: AVE DART %s vm-base %#lx (reg is not the FDT DART)", paired, vm);
             return 0;
         }
     }
@@ -2876,16 +2895,16 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
 
     adt_path = ave_match_adt(node, &dart_path, &dt_addr);
     if (!adt_path) {
-        printf("FDT: AVE %s: no ADT ave/ave0/ave1 at %#lx\n", path, dt_addr);
+        ave_soft("FDT: AVE %s: no ADT ave/ave0/ave1 at %#lx", path, dt_addr);
         return 0;
     }
     anode = adt_path_offset(adt, adt_path);
     if (anode < 0) {
-        printf("FDT: AVE %s: ADT %s disappeared\n", path, adt_path);
+        ave_soft("FDT: AVE %s: ADT %s disappeared", path, adt_path);
         return 0;
     }
     if (ADT_GETPROP(adt, anode, "pre-loaded", &preloaded) != sizeof(preloaded) || preloaded != 1) {
-        printf("FDT: AVE %s: firmware not preloaded (ADT %s)\n", path, adt_path);
+        ave_soft("FDT: AVE %s: firmware not preloaded (ADT %s)", path, adt_path);
         return 0;
     }
 
@@ -2893,7 +2912,7 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
     names = adt_getprop(adt, anode, "segment-names", &names_len);
     if (!seg || !names || !seg_len || seg_len % sizeof(*seg) || seg_len / sizeof(*seg) > 4 ||
         !names_len) {
-        printf("FDT: AVE %s: invalid ADT segment list\n", path);
+        ave_soft("FDT: AVE %s: invalid ADT segment list", path);
         return 0;
     }
     count = seg_len / sizeof(*seg);
@@ -2905,19 +2924,19 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
 
         if (ave_segment_name(names, names_len, &pos, name, sizeof(name)) ||
             (i + 1 < count && (pos >= names_len || names[pos++] != ';'))) {
-            printf("FDT: AVE %s: bad segment name\n", path);
+            ave_soft("FDT: AVE %s: bad segment name", path);
             return 0;
         }
         if (!strcmp(name, "text")) {
             if (got_text) {
-                printf("FDT: AVE %s: repeated TEXT segment\n", path);
+                ave_soft("FDT: AVE %s: repeated TEXT segment", path);
                 return 0;
             }
             dest = &text;
             got_text = true;
         } else if (!strcmp(name, "data")) {
             if (got_data) {
-                printf("FDT: AVE %s: repeated DATA segment\n", path);
+                ave_soft("FDT: AVE %s: repeated DATA segment", path);
                 return 0;
             }
             dest = &data;
@@ -2931,17 +2950,17 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
         dest->size = seg[i].size;
     }
     if (pos < names_len && (names[pos] != 0 || pos + 1 != names_len)) {
-        printf("FDT: AVE %s: trailing segment-names\n", path);
+        ave_soft("FDT: AVE %s: trailing segment-names", path);
         return 0;
     }
     if (count != 2 || !got_text || !got_data) {
-        printf("FDT: AVE %s: need TEXT and DATA, ADT has %zu segments\n", path, count);
+        ave_soft("FDT: AVE %s: need TEXT and DATA, ADT has %zu segments", path, count);
         return 0;
     }
     if (text.size != AVE_6070_TEXT_SIZE || data.size != AVE_6070_DATA_SIZE) {
-        printf("FDT: AVE %s: unexpected segment sizes TEXT %#lx DATA %#lx "
-               "(6070.11.1 is TEXT %#x DATA %#x)\n",
-               path, text.size, data.size, AVE_6070_TEXT_SIZE, AVE_6070_DATA_SIZE);
+        ave_soft("FDT: AVE %s: unexpected segment sizes TEXT %#lx DATA %#lx "
+                 "(6070.11.1 is TEXT %#x DATA %#x)",
+                 path, text.size, data.size, AVE_6070_TEXT_SIZE, AVE_6070_DATA_SIZE);
         return 0;
     }
 
@@ -2949,7 +2968,7 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
     if (dram < 0 || ADT_GETPROP(adt, dram, "dram-base", &dram_base) != sizeof(dram_base) ||
         ADT_GETPROP(adt, dram, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size ||
         dram_base > UINT64_MAX - dram_size || dram_base > cur_boot_args.phys_base) {
-        printf("FDT: AVE %s: no DRAM window below the boot image\n", path);
+        ave_soft("FDT: AVE %s: no DRAM window below the boot image", path);
         return 0;
     }
     if ((text.phys | data.phys) & (SZ_16K - 1) || text.phys < dram_base || data.phys < dram_base ||
@@ -2957,13 +2976,13 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
         text.size > cur_boot_args.phys_base - text.phys ||
         data.size > cur_boot_args.phys_base - data.phys ||
         (text.phys < data.phys + data.size && data.phys < text.phys + text.size)) {
-        printf("FDT: AVE %s: segments not in the pre-OS window "
-               "(TEXT %#lx DATA %#lx, boot %#lx)\n",
-               path, text.phys, data.phys, cur_boot_args.phys_base);
+        ave_soft("FDT: AVE %s: segments not in the pre-OS window "
+                 "(TEXT %#lx DATA %#lx, boot %#lx)",
+                 path, text.phys, data.phys, cur_boot_args.phys_base);
         return 0;
     }
     if (text.size < AVE_6070_LINK_CELL + sizeof(cell)) {
-        printf("FDT: AVE %s: TEXT shorter than the link cell\n", path);
+        ave_soft("FDT: AVE %s: TEXT shorter than the link cell", path);
         return 0;
     }
     /*
@@ -2979,17 +2998,17 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
     }
 
     if (ave_dart_vm_base(node, dart_path, &vm_base)) {
-        printf("FDT: AVE %s: AVE DART vm-base missing (paired %s)\n", path,
-               dart_path ? dart_path : "none");
+        ave_soft("FDT: AVE %s: AVE DART vm-base missing (paired %s)", path,
+                 dart_path ? dart_path : "none");
         return 0;
     }
     text_iova = text.iova | vm_base;
     data_iova = data.iova | vm_base;
     if (!ave_6070_window(text_iova, data_iova, text.size, cell)) {
-        printf("FDT: AVE %s: firmware is not at the DART window "
-               "(vm-base %#lx, iova %#lx/%#lx -> %#lx/%#lx, remap %#lx/%#lx, link %#lx)\n",
-               path, vm_base, text.iova, data.iova, text_iova, data_iova, text.remap, data.remap,
-               cell);
+        ave_soft("FDT: AVE %s: firmware is not at the DART window "
+                 "(vm-base %#lx, iova %#lx/%#lx -> %#lx/%#lx, remap %#lx/%#lx, link %#lx)",
+                 path, vm_base, text.iova, data.iova, text_iova, data_iova, text.remap, data.remap,
+                 cell);
         return 0;
     }
 
@@ -2998,7 +3017,7 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
     if (text_slot < 0)
         bail("FDT: '/reserved-memory' not found\n");
     if (text_slot) {
-        printf("FDT: AVE %s: TEXT %s is already owned\n", path, reason);
+        ave_soft("FDT: AVE %s: TEXT %s is already owned", path, reason);
         return 0;
     }
     snprintf(reason, sizeof(reason), "asc-firmware@%lx", data.phys);
@@ -3006,7 +3025,7 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
     if (data_slot < 0)
         bail("FDT: '/reserved-memory' not found\n");
     if (data_slot) {
-        printf("FDT: AVE %s: DATA %s is already owned\n", path, reason);
+        ave_soft("FDT: AVE %s: DATA %s is already owned", path, reason);
         return 0;
     }
 
@@ -3020,8 +3039,8 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
         ave_export_crc("aurora,ave-data-crc32", data_crc))
         bail("FDT: AVE %s: CRC export failed\n", path);
 
-    printf("FDT: AVE %s from %s: TEXT %#lx/%#lx CRC %08x, DATA %#lx/%#lx CRC %08x\n", path,
-           adt_path, text.phys, text_iova, text_crc, data.phys, data_iova, data_crc);
+    ave_soft("FDT: AVE %s from %s: TEXT %#lx/%#lx CRC %08x, DATA %#lx/%#lx CRC %08x", path,
+             adt_path, text.phys, text_iova, text_crc, data.phys, data_iova, data_crc);
     return 0;
 }
 
@@ -3047,7 +3066,7 @@ static int dt_set_t6021_aves(void)
             if (count < ARRAY_SIZE(phandles))
                 phandles[count++] = ph;
             else
-                printf("FDT: AVE: ignoring extra apple,t6021-ave node\n");
+                ave_soft("FDT: AVE: ignoring extra apple,t6021-ave node");
         }
     } while (edited);
 
