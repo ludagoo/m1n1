@@ -2633,7 +2633,10 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
  * appended to /chosen aurora,ave-handoff, since Linux does not keep this
  * console. A node iBoot did not preload is left as the DT has it, so the
  * driver reports "no preloaded firmware" instead of being pointed at some
- * other coprocessor's image.
+ * other coprocessor's image. A preloaded image this driver does not accept
+ * is also left unpublished. Its addresses, CRC32s, version strings and the
+ * ADT version properties are recorded on /chosen aurora,ave-fwinfo, one
+ * string per encoder.
  */
 #define AVE_6070_TEXT_SIZE 0xd0000u
 #define AVE_6070_DATA_SIZE 0x128000u
@@ -2776,6 +2779,360 @@ static int ave_export_crc(const char *prop, u32 crc)
     return fdt_setprop_string(dt, chosen, prop, value);
 }
 
+/*
+ * Identity of a preloaded t6021 image this handoff does not publish.
+ * One string per encoder on /chosen aurora,ave-fwinfo. Nothing here
+ * reserves memory or adds a memory-region.
+ */
+#define AVE_FWINFO_CAP     6144
+#define AVE_FWINFO_RESERVE 16
+#define AVE_FWINFO_EXCERPT 200
+#define AVE_FWINFO_BACK    48
+#define AVE_FWINFO_HITS    6
+#define AVE_FWINFO_SCAN    32
+#define AVE_FWINFO_PROPS   16
+#define AVE_FWINFO_TEXT    160
+/* Larger than any AVE image this driver knows. Do not scan past it. */
+#define AVE_FWINFO_MAX_READ (4u * 1024u * 1024u)
+
+struct ave_note {
+    char *p;
+    size_t cap;
+    size_t len;
+    bool cut;
+};
+
+static void ave_note_add(struct ave_note *n, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static void ave_note_add(struct ave_note *n, const char *fmt, ...)
+{
+    va_list ap;
+    size_t room;
+    int wrote;
+
+    if (n->cut || n->len + AVE_FWINFO_RESERVE >= n->cap)
+        return;
+    room = n->cap - AVE_FWINFO_RESERVE - n->len;
+    va_start(ap, fmt);
+    wrote = vsnprintf(n->p + n->len, room, fmt, ap);
+    va_end(ap);
+    if (wrote < 0 || (size_t)wrote >= room) {
+        n->len = n->cap - AVE_FWINFO_RESERVE - 1;
+        n->p[n->len] = 0;
+        n->cut = true;
+        return;
+    }
+    n->len += (size_t)wrote;
+}
+
+static int ave_printable(u8 c)
+{
+    return c >= 0x20 && c <= 0x7e;
+}
+
+/* The same pre-OS DRAM window the publish path reads, and no larger. */
+static int ave_preos_readable(u64 phys, u64 size)
+{
+    int node;
+    u64 dram_base, dram_size, boot;
+
+    if (!size || size > AVE_FWINFO_MAX_READ || size > UINT32_MAX)
+        return 0;
+    boot = cur_boot_args.phys_base;
+    node = adt_path_offset(adt, "/chosen");
+    if (node < 0 || ADT_GETPROP(adt, node, "dram-base", &dram_base) != sizeof(dram_base) ||
+        ADT_GETPROP(adt, node, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size ||
+        dram_base > UINT64_MAX - dram_size || dram_base > boot)
+        return 0;
+    if (phys < dram_base || phys >= boot || size > boot - phys)
+        return 0;
+    if (phys - dram_base > dram_size || size > dram_size - (phys - dram_base))
+        return 0;
+    return 1;
+}
+
+/* One byte. A fault marks the destination register and returns here. */
+static void __attribute__((noinline)) ave_probe_byte(u64 addr)
+{
+    u8 b = read8(addr);
+
+    (void)b;
+}
+
+static int ave_probe_range(u64 phys, u64 size)
+{
+    enum exc_guard_t saved = exc_guard;
+    int before = exc_count;
+    u64 off;
+
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    for (off = 0; off < size; off += SZ_16K)
+        ave_probe_byte(phys + off);
+    ave_probe_byte(phys + size - 1);
+    /* An SError from those loads must arrive before the guard comes off. */
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = saved;
+    return exc_count == before;
+}
+
+struct ave_mark {
+    u64 off;
+    const char *name;
+};
+
+static u64 ave_find_mark(const u8 *buf, u64 size, const char *mark, u64 from)
+{
+    size_t n = strlen(mark);
+    u64 i;
+
+    if (!n || from >= size || size - from < n)
+        return size;
+    for (i = from; i + n <= size; i++) {
+        if (buf[i] == (u8)mark[0] && !memcmp(buf + i, mark, n))
+            return i;
+    }
+    return size;
+}
+
+static void ave_note_segment(struct ave_note *n, const char *label, const struct ave_6070_seg *seg)
+{
+    static const char *const marks[] = {"AppleAVE", "AVE2FW", "@(#)", "PROGRAM:"};
+    struct ave_mark hit[AVE_FWINFO_SCAN];
+    size_t nhit = 0, emitted = 0;
+    const u8 *bytes;
+    bool capped = false;
+    u32 crc;
+
+    ave_note_add(n, "\n%s", label);
+    if (!seg) {
+        ave_note_add(n, " absent");
+        return;
+    }
+    ave_note_add(n, " phys=%#lx size=%#lx", seg->phys, seg->size);
+    if (!ave_preos_readable(seg->phys, seg->size) || !ave_probe_range(seg->phys, seg->size)) {
+        ave_note_add(n, " crc=unread");
+        return;
+    }
+    crc = tinf_crc32((void *)seg->phys, (unsigned int)seg->size);
+    ave_note_add(n, " crc=%08x", crc);
+
+    bytes = (const u8 *)seg->phys;
+    for (size_t m = 0; m < ARRAY_SIZE(marks); m++) {
+        u64 from = 0;
+
+        for (;;) {
+            u64 at = ave_find_mark(bytes, seg->size, marks[m], from);
+
+            if (at >= seg->size)
+                break;
+            if (nhit >= ARRAY_SIZE(hit)) {
+                capped = true;
+                break;
+            }
+            hit[nhit].off = at;
+            hit[nhit].name = marks[m];
+            nhit++;
+            from = at + 1;
+        }
+        if (capped)
+            break;
+    }
+    for (size_t i = 1; i < nhit; i++) {
+        struct ave_mark key = hit[i];
+        size_t j = i;
+
+        while (j > 0 && hit[j - 1].off > key.off) {
+            hit[j] = hit[j - 1];
+            j--;
+        }
+        hit[j] = key;
+    }
+
+    /* Later markers that sit inside an excerpt already printed are one string. */
+    {
+        u64 window = 0;
+
+        for (size_t i = 0; i < nhit; i++) {
+            char excerpt[AVE_FWINFO_EXCERPT + 1];
+            u64 start = hit[i].off;
+            size_t back = 0, nexc = 0;
+
+            if (i > 0 && hit[i].off == hit[i - 1].off)
+                continue;
+            if (emitted && hit[i].off < window)
+                continue;
+            while (start > 0 && back < AVE_FWINFO_BACK && ave_printable(bytes[start - 1])) {
+                start--;
+                back++;
+            }
+            while (start + nexc < seg->size && nexc < AVE_FWINFO_EXCERPT &&
+                   ave_printable(bytes[start + nexc])) {
+                excerpt[nexc] = (char)bytes[start + nexc];
+                nexc++;
+            }
+            excerpt[nexc] = 0;
+            window = start + nexc;
+            if (emitted >= AVE_FWINFO_HITS) {
+                capped = true;
+                break;
+            }
+            ave_note_add(n, "\n%s+%#lx %s: %s", label, hit[i].off, hit[i].name, excerpt);
+            emitted++;
+        }
+    }
+    if (!emitted)
+        ave_note_add(n, "\n%s strings: no AppleAVE, AVE2FW, @(#), or PROGRAM:", label);
+    else if (capped)
+        ave_note_add(n, "\n%s strings: more hits omitted", label);
+}
+
+static int ave_prop_wanted(const char *name)
+{
+    static const char *const keys[] = {
+        "version", "compat", "build", "firmw", "revis", "program", "banner", "ident", "fw",
+    };
+    char lower[33];
+    size_t n = strnlen(name, 32);
+
+    for (size_t i = 0; i < n; i++) {
+        char c = name[i];
+
+        lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    lower[n] = 0;
+    for (size_t i = 0; i < ARRAY_SIZE(keys); i++) {
+        if (strstr(lower, keys[i]))
+            return 1;
+    }
+    return 0;
+}
+
+static int ave_prop_text(const u8 *p, u32 size)
+{
+    int any = 0;
+
+    if (!size || size > 256)
+        return 0;
+    for (u32 i = 0; i < size; i++) {
+        if (p[i] == 0)
+            continue;
+        if (!ave_printable(p[i]))
+            return 0;
+        any = 1;
+    }
+    return any;
+}
+
+static void ave_note_prop_text(struct ave_note *n, const u8 *p, u32 size)
+{
+    u32 i = 0;
+    int chars = 0, piece = 0;
+
+    ave_note_add(n, "=");
+    while (i < size && chars < AVE_FWINFO_TEXT) {
+        if (p[i] == 0) {
+            i++;
+            continue;
+        }
+        if (piece)
+            ave_note_add(n, " | ");
+        piece++;
+        while (i < size && p[i] && ave_printable(p[i]) && chars < AVE_FWINFO_TEXT) {
+            ave_note_add(n, "%c", p[i]);
+            i++;
+            chars++;
+        }
+        /* ave_prop_text() only hands us printable bytes and NULs. */
+        if (i < size && p[i] && !ave_printable(p[i]))
+            break;
+    }
+    if (i < size)
+        ave_note_add(n, "...");
+}
+
+static void ave_note_props(struct ave_note *n, int anode)
+{
+    int count = 0;
+
+    ave_note_add(n, "\nadt");
+    if (anode < 0) {
+        ave_note_add(n, " missing");
+        return;
+    }
+    ADT_FOREACH_PROPERTY(adt, anode, prop)
+    {
+        char name[33];
+        size_t nl = strnlen(prop->name, sizeof(prop->name));
+
+        memcpy(name, prop->name, nl);
+        name[nl] = 0;
+        if (!nl || !ave_prop_wanted(name))
+            continue;
+        if (count >= AVE_FWINFO_PROPS) {
+            ave_note_add(n, "\nadt more");
+            break;
+        }
+        count++;
+        ave_note_add(n, "\nadt %s", name);
+        if (ave_prop_text(prop->value, prop->size))
+            ave_note_prop_text(n, prop->value, prop->size);
+        if (prop->size == 4 || prop->size == 8) {
+            u64 v = 0;
+
+            memcpy(&v, prop->value, prop->size);
+            ave_note_add(n, " u%u=%#lx", prop->size * 8, v);
+        } else if (!ave_prop_text(prop->value, prop->size)) {
+            ave_note_add(n, " <%u bytes>", prop->size);
+        }
+    }
+    if (!count)
+        ave_note_add(n, " none");
+}
+
+static void ave_puts(const char *s)
+{
+    while (*s) {
+        char chunk[400];
+        size_t n = 0;
+
+        while (s[n] && n + 1 < sizeof(chunk)) {
+            chunk[n] = s[n];
+            n++;
+        }
+        chunk[n] = 0;
+        printf("%s", chunk);
+        s += n;
+    }
+}
+
+static void ave_describe_unaccepted(const char *path, const char *adt_path, int anode,
+                                    const struct ave_6070_seg *text,
+                                    const struct ave_6070_seg *data)
+{
+    static char buf[AVE_FWINFO_CAP];
+    struct ave_note note = {.p = buf, .cap = sizeof(buf), .len = 0, .cut = false};
+    int chosen;
+
+    buf[0] = 0;
+    ave_note_add(&note, "%s adt=%s", path, adt_path ? adt_path : "?");
+    ave_note_segment(&note, "TEXT", text);
+    ave_note_segment(&note, "DATA", data);
+    ave_note_props(&note, anode);
+    if (note.cut && note.len + 12 < note.cap) {
+        memcpy(buf + note.len, "\ntruncated", 11);
+        note.len += 11;
+        buf[note.len] = 0;
+    }
+
+    chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0 || fdt_appendprop_string(dt, chosen, "aurora,ave-fwinfo", buf))
+        printf("FDT: AVE: could not record firmware identity\n");
+    ave_puts(buf);
+    printf("\n");
+}
+
 /* vm-base of the DART that translates this encoder, matched by MMIO address. */
 static int ave_dart_vm_base(int node, const char *paired, u64 *vm_base)
 {
@@ -2874,6 +3231,15 @@ static const char *ave_match_adt(int node, const char **dart_path, u64 *dt_addr)
     return NULL;
 }
 
+/* A preloaded image that is not published still gets an identity record. */
+#define ave_leave(...)                                                                             \
+    do {                                                                                           \
+        ave_soft(__VA_ARGS__);                                                                     \
+        ave_describe_unaccepted(path, adt_path, anode, got_text ? &text : NULL,                    \
+                                got_data ? &data : NULL);                                          \
+        return 0;                                                                                  \
+    } while (0)
+
 /* Hand one encoder over, or leave it unchanged and log why. */
 static int dt_set_t6021_ave_node(int node, u32 phandle)
 {
@@ -2912,8 +3278,7 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
     names = adt_getprop(adt, anode, "segment-names", &names_len);
     if (!seg || !names || !seg_len || seg_len % sizeof(*seg) || seg_len / sizeof(*seg) > 4 ||
         !names_len) {
-        ave_soft("FDT: AVE %s: invalid ADT segment list", path);
-        return 0;
+        ave_leave("FDT: AVE %s: invalid ADT segment list", path);
     }
     count = seg_len / sizeof(*seg);
     memset(&text, 0, sizeof(text));
@@ -2924,20 +3289,17 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
 
         if (ave_segment_name(names, names_len, &pos, name, sizeof(name)) ||
             (i + 1 < count && (pos >= names_len || names[pos++] != ';'))) {
-            ave_soft("FDT: AVE %s: bad segment name", path);
-            return 0;
+            ave_leave("FDT: AVE %s: bad segment name", path);
         }
         if (!strcmp(name, "text")) {
             if (got_text) {
-                ave_soft("FDT: AVE %s: repeated TEXT segment", path);
-                return 0;
+                ave_leave("FDT: AVE %s: repeated TEXT segment", path);
             }
             dest = &text;
             got_text = true;
         } else if (!strcmp(name, "data")) {
             if (got_data) {
-                ave_soft("FDT: AVE %s: repeated DATA segment", path);
-                return 0;
+                ave_leave("FDT: AVE %s: repeated DATA segment", path);
             }
             dest = &data;
             got_data = true;
@@ -2950,40 +3312,34 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
         dest->size = seg[i].size;
     }
     if (pos < names_len && (names[pos] != 0 || pos + 1 != names_len)) {
-        ave_soft("FDT: AVE %s: trailing segment-names", path);
-        return 0;
+        ave_leave("FDT: AVE %s: trailing segment-names", path);
     }
     if (count != 2 || !got_text || !got_data) {
-        ave_soft("FDT: AVE %s: need TEXT and DATA, ADT has %zu segments", path, count);
-        return 0;
+        ave_leave("FDT: AVE %s: need TEXT and DATA, ADT has %zu segments", path, count);
     }
     if (text.size != AVE_6070_TEXT_SIZE || data.size != AVE_6070_DATA_SIZE) {
-        ave_soft("FDT: AVE %s: unexpected segment sizes TEXT %#lx DATA %#lx "
-                 "(6070.11.1 is TEXT %#x DATA %#x)",
-                 path, text.size, data.size, AVE_6070_TEXT_SIZE, AVE_6070_DATA_SIZE);
-        return 0;
+        ave_leave("FDT: AVE %s: unexpected segment sizes TEXT %#lx DATA %#lx "
+                  "(6070.11.1 is TEXT %#x DATA %#x)",
+                  path, text.size, data.size, AVE_6070_TEXT_SIZE, AVE_6070_DATA_SIZE);
     }
 
     dram = adt_path_offset(adt, "/chosen");
     if (dram < 0 || ADT_GETPROP(adt, dram, "dram-base", &dram_base) != sizeof(dram_base) ||
         ADT_GETPROP(adt, dram, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size ||
         dram_base > UINT64_MAX - dram_size || dram_base > cur_boot_args.phys_base) {
-        ave_soft("FDT: AVE %s: no DRAM window below the boot image", path);
-        return 0;
+        ave_leave("FDT: AVE %s: no DRAM window below the boot image", path);
     }
     if ((text.phys | data.phys) & (SZ_16K - 1) || text.phys < dram_base || data.phys < dram_base ||
         text.phys >= cur_boot_args.phys_base || data.phys >= cur_boot_args.phys_base ||
         text.size > cur_boot_args.phys_base - text.phys ||
         data.size > cur_boot_args.phys_base - data.phys ||
         (text.phys < data.phys + data.size && data.phys < text.phys + text.size)) {
-        ave_soft("FDT: AVE %s: segments not in the pre-OS window "
-                 "(TEXT %#lx DATA %#lx, boot %#lx)",
-                 path, text.phys, data.phys, cur_boot_args.phys_base);
-        return 0;
+        ave_leave("FDT: AVE %s: segments not in the pre-OS window "
+                  "(TEXT %#lx DATA %#lx, boot %#lx)",
+                  path, text.phys, data.phys, cur_boot_args.phys_base);
     }
     if (text.size < AVE_6070_LINK_CELL + sizeof(cell)) {
-        ave_soft("FDT: AVE %s: TEXT shorter than the link cell", path);
-        return 0;
+        ave_leave("FDT: AVE %s: TEXT shorter than the link cell", path);
     }
     /*
      * The cell is only 4-byte aligned, and this image is built with
@@ -2998,18 +3354,16 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
     }
 
     if (ave_dart_vm_base(node, dart_path, &vm_base)) {
-        ave_soft("FDT: AVE %s: AVE DART vm-base missing (paired %s)", path,
-                 dart_path ? dart_path : "none");
-        return 0;
+        ave_leave("FDT: AVE %s: AVE DART vm-base missing (paired %s)", path,
+                  dart_path ? dart_path : "none");
     }
     text_iova = text.iova | vm_base;
     data_iova = data.iova | vm_base;
     if (!ave_6070_window(text_iova, data_iova, text.size, cell)) {
-        ave_soft("FDT: AVE %s: firmware is not at the DART window "
-                 "(vm-base %#lx, iova %#lx/%#lx -> %#lx/%#lx, remap %#lx/%#lx, link %#lx)",
-                 path, vm_base, text.iova, data.iova, text_iova, data_iova, text.remap, data.remap,
-                 cell);
-        return 0;
+        ave_leave("FDT: AVE %s: firmware is not at the DART window "
+                  "(vm-base %#lx, iova %#lx/%#lx -> %#lx/%#lx, remap %#lx/%#lx, link %#lx)",
+                  path, vm_base, text.iova, data.iova, text_iova, data_iova, text.remap, data.remap,
+                  cell);
     }
 
     snprintf(reason, sizeof(reason), "asc-firmware@%lx", text.phys);
@@ -3017,16 +3371,14 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
     if (text_slot < 0)
         bail("FDT: '/reserved-memory' not found\n");
     if (text_slot) {
-        ave_soft("FDT: AVE %s: TEXT %s is already owned", path, reason);
-        return 0;
+        ave_leave("FDT: AVE %s: TEXT %s is already owned", path, reason);
     }
     snprintf(reason, sizeof(reason), "asc-firmware@%lx", data.phys);
     int data_slot = ave_region_available(reason, data.phys, data.size);
     if (data_slot < 0)
         bail("FDT: '/reserved-memory' not found\n");
     if (data_slot) {
-        ave_soft("FDT: AVE %s: DATA %s is already owned", path, reason);
-        return 0;
+        ave_leave("FDT: AVE %s: DATA %s is already owned", path, reason);
     }
 
     if (ave_attach_region(path, phandle, text.phys, text_iova, text.size) ||
@@ -3043,6 +3395,7 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
              adt_path, text.phys, text_iova, text_crc, data.phys, data_iova, data_crc);
     return 0;
 }
+#undef ave_leave
 
 static int dt_set_t6021_aves(void)
 {
