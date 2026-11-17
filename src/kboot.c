@@ -2625,21 +2625,24 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
  *
  * apple-ave refuses a node that does not have exactly two memory-regions
  * (TEXT, then DATA), each an apple,asc-mem / no-map reservation whose
- * iommu-addresses tuple is <&ave iova size>. The 6070.11.1 image is TEXT
- * 0xd0000 and DATA 0x128000. TEXT's DART address is the encoder DART's
- * vm-base (its low 32 bits are 0) and DATA follows it; that is the T8112
- * handoff, not the M4 remap addresses. /chosen aurora,ave-text-crc32 and
- * aurora,ave-data-crc32 are the raw segment CRC32s. The same lines are
- * appended to /chosen aurora,ave-handoff, since Linux does not keep this
- * console. A node iBoot did not preload is left as the DT has it, so the
- * driver reports "no preloaded firmware" instead of being pointed at some
+ * iommu-addresses tuple is <&ave iova size>. j475c preloads AppleAVE2FW_H14C,
+ * still 6070.11.1, with TEXT 0xf0000 and DATA 0x134000. ave0 and ave1 share
+ * that TEXT. The second encoder appends its own tuple instead of leaving the
+ * reservation owned by the first. Each reservation gets aurora,crc32 because
+ * the DATA images differ. TEXT's DART address is the encoder DART's vm-base
+ * (its low 32 bits are 0) and DATA follows it in the IOVA space; that is the
+ * T8112 handoff, not the M4 remap addresses. /chosen aurora,ave-text-crc32 and
+ * aurora,ave-data-crc32 are the raw segment CRC32s of the first encoder. The
+ * same lines are appended to /chosen aurora,ave-handoff, since Linux does not
+ * keep this console. A node iBoot did not preload is left as the DT has it, so
+ * the driver reports "no preloaded firmware" instead of being pointed at some
  * other coprocessor's image. A preloaded image this driver does not accept
  * is also left unpublished. Its addresses, CRC32s, version strings and the
  * ADT version properties are recorded on /chosen aurora,ave-fwinfo, one
  * string per encoder.
  */
-#define AVE_6070_TEXT_SIZE 0xd0000u
-#define AVE_6070_DATA_SIZE 0x128000u
+#define AVE_T6021_TEXT_SIZE 0xf0000u
+#define AVE_T6021_DATA_SIZE 0x134000u
 #define AVE_6070_LINK_CELL 0x423cu
 #define AVE_T6021_MAX      4
 
@@ -2777,6 +2780,47 @@ static int ave_export_crc(const char *prop, u32 crc)
         return 0;
     }
     return fdt_setprop_string(dt, chosen, prop, value);
+}
+
+/* 1 when name is already a reservation of this phys and size. */
+static int ave_reservation_matches(const char *name, u64 phys, u64 size)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    int node, len;
+    const fdt64_t *reg;
+
+    if (resv < 0)
+        return -1;
+    node = fdt_subnode_offset(dt, resv, name);
+    if (node < 0)
+        return 0;
+    reg = fdt_getprop(dt, node, "reg", &len);
+    if (!reg || len != (int)sizeof(u64) * 2 || fdt64_ld(reg) != phys || fdt64_ld(reg + 1) != size)
+        return 0;
+    return 1;
+}
+
+/* Per-reservation CRC. A second encoder sharing TEXT must see the same value. */
+static int ave_stamp_crc(const char *name, u32 crc)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    int node;
+    char value[9];
+    const char *have;
+
+    if (resv < 0)
+        return -1;
+    node = fdt_subnode_offset(dt, resv, name);
+    if (node < 0)
+        return -1;
+    snprintf(value, sizeof(value), "%08x", crc);
+    have = fdt_getprop(dt, node, "aurora,crc32", NULL);
+    if (have) {
+        if (strcmp(have, value))
+            ave_soft("FDT: AVE: %s aurora,crc32 is %s, this segment is %s", name, have, value);
+        return 0;
+    }
+    return fdt_setprop_string(dt, node, "aurora,crc32", value);
 }
 
 /*
@@ -3317,10 +3361,10 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
     if (count != 2 || !got_text || !got_data) {
         ave_leave("FDT: AVE %s: need TEXT and DATA, ADT has %zu segments", path, count);
     }
-    if (text.size != AVE_6070_TEXT_SIZE || data.size != AVE_6070_DATA_SIZE) {
+    if (text.size != AVE_T6021_TEXT_SIZE || data.size != AVE_T6021_DATA_SIZE) {
         ave_leave("FDT: AVE %s: unexpected segment sizes TEXT %#lx DATA %#lx "
-                  "(6070.11.1 is TEXT %#x DATA %#x)",
-                  path, text.size, data.size, AVE_6070_TEXT_SIZE, AVE_6070_DATA_SIZE);
+                  "(t6021 6070.11.1 is TEXT %#x DATA %#x)",
+                  path, text.size, data.size, AVE_T6021_TEXT_SIZE, AVE_T6021_DATA_SIZE);
     }
 
     dram = adt_path_offset(adt, "/chosen");
@@ -3370,9 +3414,15 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
     int text_slot = ave_region_available(reason, text.phys, text.size);
     if (text_slot < 0)
         bail("FDT: '/reserved-memory' not found\n");
-    if (text_slot) {
+    /*
+     * The other encoder already published this TEXT. Appending a tuple is
+     * the share. A different reservation under the same name is not.
+     */
+    if (text_slot && ave_reservation_matches(reason, text.phys, text.size) != 1) {
         ave_leave("FDT: AVE %s: TEXT %s is already owned", path, reason);
     }
+    char text_name[64];
+    snprintf(text_name, sizeof(text_name), "%s", reason);
     snprintf(reason, sizeof(reason), "asc-firmware@%lx", data.phys);
     int data_slot = ave_region_available(reason, data.phys, data.size);
     if (data_slot < 0)
@@ -3387,7 +3437,8 @@ static int dt_set_t6021_ave_node(int node, u32 phandle)
 
     text_crc = tinf_crc32((void *)text.phys, (unsigned int)text.size);
     data_crc = tinf_crc32((void *)data.phys, (unsigned int)data.size);
-    if (ave_export_crc("aurora,ave-text-crc32", text_crc) ||
+    if (ave_stamp_crc(text_name, text_crc) || ave_stamp_crc(reason, data_crc) ||
+        ave_export_crc("aurora,ave-text-crc32", text_crc) ||
         ave_export_crc("aurora,ave-data-crc32", data_crc))
         bail("FDT: AVE %s: CRC export failed\n", path);
 
